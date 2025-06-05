@@ -16,10 +16,10 @@ on:
 
 jobs:
   build:
-    name: Create Github release
+    name: Build Pull Request
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -27,28 +27,13 @@ jobs:
           submodules: true
           fetch-depth: 0
 
-      # https://github.com/actions/checkout/issues/290
-      - name: Preserve tag annotations
-        run: git fetch -f origin ${{ github.ref }}:${{ github.ref }}
-        if: startsWith(github.ref, 'refs/tags/')
-
       - name: Get version
         id: get_version
         run: |
-          # For tags, use the tag name
-          if [[ $GITHUB_REF == refs/tags/* ]]; then
-            version=$(git describe | sed -E 's/v([0-9]*\.[0-9]*)-([0-9]+)-g([0-9a-f]+)/v\1.r\2.g\3/')
-          # For branches, use branch name + SHA
-          else
-            branch=${GITHUB_REF#refs/heads/}
-            if [[ "$branch" == "refs/pull/"* ]]; then
-              branch="pr-${GITHUB_REF#refs/pull/}"
-            fi
-            short_sha=$(git rev-parse --short HEAD)
-            version="${branch}-${short_sha}"
-            # Replace slashes with hyphens in version, the branch name may contain slashes.
-            version=$(echo "$version" | sed 's/\//-/g')
-          fi
+          # For PR builds, use PR number + SHA
+          pr_number="${{ github.event.pull_request.number }}"
+          short_sha=$(git rev-parse --short HEAD)
+          version="pr-${pr_number}-${short_sha}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Using version: $version"
 
@@ -62,27 +47,19 @@ jobs:
           java-version: 17
           cache: gradle
 
-      - name: Decode Keystore
+      - name: Generate debug keystore
         run: |
-          echo -n "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
+          keytool -genkey -v -keystore debug.keystore -storetype PKCS12 -storepass android -alias androiddebugkey \
+            -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          echo "RELEASE_KEYSTORE=${{ github.workspace }}/debug.keystore" >> $GITHUB_ENV
+          echo "RELEASE_KEY_ALIAS=androiddebugkey" >> $GITHUB_ENV
+          echo "RELEASE_KEY_PASSPHRASE=android" >> $GITHUB_ENV
+          echo "RELEASE_KEYSTORE_PASSPHRASE=android" >> $GITHUB_ENV
 
-      - name: Create SSH KEY
-        run: |
-          echo "${{ secrets.SIGNING_KEY }}" > pixelupdater.key
-          chmod 600 pixelupdater.key
-
-      - name: Build Release apk
-        env:
-          RELEASE_KEYSTORE: ${{ github.workspace }}/keystore.jks
-          RELEASE_KEY_ALIAS: release
-          RELEASE_KEY_PASSPHRASE: ${{ secrets.RELEASE_KEY_PASSPHRASE }}
-          RELEASE_KEYSTORE_PASSPHRASE: ${{ secrets.RELEASE_KEYSTORE_PASSPHRASE }}
-          SIGNING_KEY: ${{ github.workspace }}/pixelupdater.key
-          SIGNING_KEY_PASSPHRASE: ${{ secrets.SIGNING_KEY_PASSPHRASE }}
+      - name: Build PR
         run: |
           ./gradlew zipRelease
-          ./gradlew signReleaseZip
-          ./gradlew updateJsonRelease
 
       - name: Debug list artifacts
         run: |
@@ -91,40 +68,5 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: PixelUpdater-artifacts-${{ steps.get_version.outputs.version }}-release
-          path: app/build/distributions/release/*
-
-      - name: Upload release-info
-        uses: actions/upload-artifact@v4
-        id: upload_release_info
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          name: release.json
-          path: app/build/distributions/release.json
-
-      # https://github.com/ericcornelissen/git-tag-annotation-action/blob/v2.0.6/src/main.sh
-      - name: Get annotation from git for-each-ref
-        id: get_annotation
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          {
-            echo 'annotation<<EOF'
-            git for-each-ref ${{ github.ref }} --format='%(contents)' | awk '/-BEGIN PGP SIGNATURE-/{exit} {print}'
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
-
-      # Create release only if it's a tag or requested
-      - name: Create release
-        id: create_release
-        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == true)
-        uses: softprops/action-gh-release@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          tag_name: ${{ steps.get_version.outputs.version }}
-          name: Release ${{ steps.get_version.outputs.version }}
-          body: ${{ steps.get_annotation.outputs.annotation }}
-          draft: true
-          prerelease: false
-          files: |
-            app/build/distributions/release/PixelUpdater-${{ steps.get_version.outputs.version }}-release.zip
-            app/build/distributions/release/PixelUpdater-${{ steps.get_version.outputs.version }}-release.zip.sig
+          name: PixelUpdater-${{ steps.get_version.outputs.version }}
+          path: app/build/distributions/release/*.zip
